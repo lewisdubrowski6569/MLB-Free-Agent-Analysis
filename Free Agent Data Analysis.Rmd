@@ -1,0 +1,428 @@
+---
+title: "MLB Free Agency Analysis"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+
+Load the packages needed:
+```{r}
+library(readr)
+library(dplyr)
+library(rvest)
+library(stringr)
+library(tidyverse)
+library(Hmisc)
+library(formattable)
+library(ggthemes)
+```
+
+
+First, we will build a function that will read in data on all the MLB free agents from a given year.
+
+Free agent data is found at https://www.baseball-reference.com/
+```{r}
+
+#The function returns a list of signed players, unsigned batters, and unsigned pitchers for each year
+read_bref_fa_data <- function(year, site = 'https://www.baseball-reference.com/leagues/MLB/2020-free-agents.shtml'){
+  
+  #Replace the 2020 in 'site' with the year we want data for (found in the 'year' argument to the function)
+  #This allows us to iterate through each year of baseball reference data (1976 to 2020)
+  site <- str_replace(site, '2020', year)
+  
+  #read the first table from the site as 'signedPlayers'
+  webpage <- read_html(site)
+  signedPlayers <- html_table(webpage)[[1]]
+  
+  #read individual player pages and player baseball reference IDs as char vectors
+  playerSites <- webpage %>% html_nodes('a') %>% html_attr('href')
+  playerIds <- webpage %>% html_nodes('td') %>% html_attr('data-append-csv')
+  
+  #translate our char vectors into new columns in our 'signedPlayers' dataframe
+  signedPlayers$playerPage <- playerSites[grepl('players', playerSites) & grepl('.shtml', playerSites)][1:nrow(signedPlayers)]
+  signedPlayers$playerID <- playerIds[!is.na(playerIds)]
+
+  #read the unsigned players into new dataframe
+  unsigned <- webpage %>% html_nodes(xpath = '//comment()') %>%
+    html_text() %>%
+    paste(collapse = '') %>%
+    read_html()
+  
+  #separate batters and pitchers
+  unsignedBatters <- html_table(unsigned)[[1]]
+  unsignedPitchers <- html_table(unsigned)[[2]]
+  
+  #just like with 'signedPlayers', read the player pages and ids of the unsigned batters and pitchers
+  unsigned <- unsigned %>% html_nodes('tbody')
+  unsigned_bat_ids <- unsigned[[1]] %>% 
+    html_nodes('tr') %>% 
+    html_nodes('td') %>% 
+    html_attr('data-append-csv')
+  unsigned_bat_sites <- unsigned[[1]] %>% 
+    html_nodes('tr') %>% 
+    html_nodes('td') %>%
+    html_nodes('a') %>% 
+    html_attr('href')
+  unsigned_pit_ids <- unsigned[[2]] %>% 
+    html_nodes('tr') %>% 
+    html_nodes('td') %>% 
+    html_attr('data-append-csv')
+  unsigned_pit_sites <- unsigned[[2]] %>% 
+    html_nodes('tr') %>% 
+    html_nodes('td') %>%
+    html_nodes('a') %>% 
+    html_attr('href')
+  
+  #make 'playerPage' and 'playerID' columns for unsigned batters and pitchers
+  #(just like with signed players)
+  unsignedBatters$playerPage <- unsigned_bat_sites[grepl('players', unsigned_bat_sites) & 
+                                                     grepl('.shtml', unsigned_bat_sites)]
+  unsignedBatters$playerID <- unsigned_bat_ids[!is.na(unsigned_bat_ids)]
+  
+  unsignedPitchers$playerPage <- unsigned_pit_sites[grepl('players', unsigned_pit_sites) & 
+                                                     grepl('.shtml', unsigned_pit_sites)]
+  unsignedPitchers$playerID <- unsigned_pit_ids[!is.na(unsigned_pit_ids)]
+  
+  #make column for all three dataframes that contains the year we are looking at
+  #this will be the value passed into the 'year' argument of the function
+  signedPlayers$Year <- as.integer(year)
+  unsignedBatters$Year <- as.integer(year)
+  unsignedPitchers$Year <- as.integer(year)
+  
+  #return statement making a list of all three dataframes
+  return(list(signedPlayers, unsignedBatters, unsignedPitchers))
+}
+
+```
+
+Next, we will build a dataframe with data on every team season since 1976.
+
+Team Data comes from the Lahman Database, found here: http://www.seanlahman.com/baseball-archive/statistics/
+and here:
+https://github.com/chadwickbureau/baseballdatabank
+
+```{r}
+
+#the col_types argument is necessary to make sure the right data types line up with the right columns
+TeamYears <- read_csv("https://raw.githubusercontent.com/chadwickbureau/baseballdatabank/master/core/Teams.csv", col_types = c(yearID = 'numeric', divID = 'character', DivWin = 'character', WCWin = 'character', SF = 'numeric')) %>% filter(yearID >= 1976)
+
+```
+
+Next, we will build a dataframe with data on every postseason series since 1976.
+
+Playoff Data also comes from the Lahman Database, found here: http://www.seanlahman.com/baseball-archive/statistics/
+and here:
+https://github.com/chadwickbureau/baseballdatabank
+
+```{r}
+
+PlayoffSeries <- read_csv("https://raw.githubusercontent.com/chadwickbureau/baseballdatabank/master/core/SeriesPost.csv") %>% filter(yearID >= 1976)
+
+```
+
+We can now add this postseason data to the TeamYears dataframe.
+
+```{r}
+
+#separate playoff series data into two different dataframes
+#'PlayoffSeriesWinners' contains all teams that won a playoff series and the year they won it
+PlayoffSeriesWinners <- PlayoffSeries %>% select(c(yearID, teamIDwinner))
+
+#'PlayoffSeriesLosers' contains all teams that lost a playoff series, and the year and round they lost
+PlayoffSeriesLosers <- PlayoffSeries %>% select(c(yearID, round, teamIDloser))
+
+#join 'PlayoffSeriesWinners' and 'PlayoffSeriesLosers' by teamID and yearID
+#the goal is to make one dataframe that contains each team year in the postseason
+PlayoffTeams <- PlayoffSeriesWinners %>% full_join(PlayoffSeriesLosers, by = c('yearID' = 'yearID', 'teamIDwinner' = 'teamIDloser'))
+
+#everyone who appeared in the postseason but did not lose in a round must have won the World Series
+
+#to denote this, we will make the 'round' variable equal to "CH" for 'champion'
+PlayoffTeams$round[is.na(PlayoffTeams$round)] <- 'CH'
+
+#get rid of duplicate team postseason years
+PlayoffTeams <- unique(PlayoffTeams)
+
+#join the 'TeamYears' dataframe with the 'PlayoffTeams' dataframe 
+#this adds the postseason round each team lost in to the 'TeamYears' dataframe
+TeamYears <- TeamYears %>% left_join(PlayoffTeams, by = c('yearID' = 'yearID', 'teamID' = 'teamIDwinner'))
+
+#Finally, we will rewrite the 'round' column to make everything consistent (the names of each round have changed over the years, this corrects for that)
+TeamYears$round <- ifelse(grepl('WC', TeamYears$round), 'WC',
+                          TeamYears$round)
+TeamYears$round <- ifelse(grepl('DIV|LDS', TeamYears$round), 'LDS',
+                          TeamYears$round)
+TeamYears$round <- ifelse(grepl('LCS', TeamYears$round), 'LCS',
+                          TeamYears$round)
+TeamYears$round <- ifelse(is.na(TeamYears$round), 'None', 
+                          TeamYears$round)
+
+TeamYears$round <- factor(TeamYears$round, levels=c("None", "WC", "LDS", "LCS", "WS", "CH"))
+
+
+```
+
+Now we will create a dataframe for all the teams and their franchise ID values.
+Each row contains a unique combination of team abbreviation, team name, and franchise abbreviation corresponding to the different team names and abbreviations that are present in the free agent data we loaded earlier.
+
+```{r}
+teams <- unique(TeamYears %>% select(c(teamIDBR, name, franchID)))
+
+#add one more row for the Los Angeles Angels, since this is missing from the 'teams' dataframe
+teams[nrow(teams) + 1,] <- list('LAA', 'Los Angeles Angels', 'ANA')
+```
+
+We can finally load in the player data and create a single dataframe containing all the free agent data we will look at in our analysis.
+
+```{r}
+
+#make a list of the years baseball reference has free agent data on
+years <- as.character(2020:1976)
+
+#read in the free agent data from baseball reference over our list of years
+dat <- sapply(years, read_bref_fa_data)
+
+#separate the data into three dataframes of signed players, unsigned batters, and unsigned pitchers
+signedPlayers <- do.call('rbind', dat[c(seq(1, 130, 3))])
+unsignedBatters <- do.call('rbind', dat[c(seq(2, 131, 3))])
+unsignedPitchers <- do.call('rbind', dat[c(seq(3, 132, 3))])
+
+#make columns for 'ToTeam' and 'Date' in the 'unsignedBatters' and 'unsignedPitchers' dataframes (the players didn't sign, so they did not have a date or signing team)
+#we will need these columns in order to combine the unsigned players and signed players into a single dataframe
+unsignedBatters$'ToTeam' <- "Unsigned"
+unsignedPitchers$'ToTeam' <- "Unsigned"
+unsignedBatters$'Date' <- NA
+unsignedPitchers$'Date' <- NA
+
+#select only the columns we need in each table
+signedPlayers <- signedPlayers %>% select(Name, Date, Year, 'From Team', 'To Team', Age, playerPage, playerID)
+unsignedBatters <- unsignedBatters %>% select(Name, Date, Year, 'From Team', 'ToTeam', Age, playerPage, playerID)
+unsignedPitchers <- unsignedPitchers %>% select(Name, Date, Year, 'From Team', 'ToTeam', Age, playerPage, playerID)
+
+#get rid of 'HOF' at the end of hall of famers names
+signedPlayers$Name <- gsub(" HOF", "", signedPlayers$Name)
+
+#split the signed and unsigned players' 'Name' column into first and last name
+signedPlayers <- separate(signedPlayers, col = Name, 
+                  into = c("fName","lName"), sep = " ", extra = 'merge')
+unsignedBatters <- separate(unsignedBatters, col = Name, 
+                          into = c("fName","lName"), sep = " ", extra = 'merge')
+unsignedPitchers <- separate(unsignedPitchers, col = Name, 
+                          into = c("fName","lName"), sep = " ", extra = 'merge')
+
+#adjust the names of columns in all dataframes (put them in the same order so we can bind the dataframes)
+names(signedPlayers) <- c('fName', 'lname', 'dateSigned', 'faYear', 'fromTeam', 'toTeam', 'age', 'playerPage', 'brefID')
+names(unsignedBatters) <- c('fName', 'lname', 'dateSigned', 'faYear', 'fromTeam', 'toTeam', 'age', 'playerPage', 'brefID')
+names(unsignedPitchers) <- c('fName', 'lname', 'dateSigned', 'faYear', 'fromTeam', 'toTeam', 'age', 'playerPage', 'brefID')
+
+#match signed players with their franchise ids
+signedPlayers <- signedPlayers %>% left_join(teams, by = c('toTeam' = 'name'))
+signedPlayers <- signedPlayers %>% left_join(teams, by = c('fromTeam' = 'teamIDBR'))
+
+#fix column order (again, to make sure it's in the same order as the 'unsignedBatters' and 'unsignedPitchers' dataframes and select the ones we need
+#rename franchID.x and franchID.y to 'toTeam' and 'fromTeam'
+signedPlayers <- signedPlayers %>% select('fName', 'lname', 'dateSigned', 'faYear', franchID.y, franchID.x, age, playerPage, brefID) %>% 
+  rename('toTeam' = franchID.x,
+         'fromTeam' = franchID.y)
+
+#get rid of duplicate player entries
+signedPlayers <- unique(signedPlayers)
+
+#change the 'fromTeam' column in 'unsignedBatters' and 'unsignedPitchers' to the franchise abbreviation ('franchID') instead of the team abbreviation ('teamID')
+#this fixes a problem where some players from the same team are listed under different abbreviations
+
+unsignedBatters <- unsignedBatters %>% left_join(teams, by = c('fromTeam' = 'teamIDBR'))
+unsignedPitchers <- unsignedPitchers %>% left_join(teams, by = c('fromTeam' = 'teamIDBR'))
+
+#select the columns we want and rename 'franchID' to 'fromTeam'
+unsignedBatters <- unsignedBatters %>% select('fName', 'lname', 'dateSigned', 'faYear', franchID, toTeam, age, playerPage, brefID) %>% 
+  rename('fromTeam' = franchID)
+unsignedPitchers <- unsignedPitchers %>% select('fName', 'lname', 'dateSigned', 'faYear', franchID, toTeam, age, playerPage, brefID) %>% 
+  rename('fromTeam' = franchID)
+
+
+#at this point, some of the players in 'signedPlayers' do not have a signing team listed in the 'toTeam' column
+#for some reason, this didn't transfer over from baseball reference
+
+#to fix this, we will manually add the signing team to each player in 'signedPlayers' who doesn't have it listed
+for(player in which(is.na(signedPlayers$toTeam))){
+  
+  #read in the individual player page we're looking at
+  website <- read_html(paste('https://www.baseball-reference.com', 
+                             signedPlayers$playerPage[player], sep = ""))
+  
+  #make a character vector of the player's transactions
+  transactions <- website %>% html_nodes(xpath = '//comment()') %>%
+    html_text() %>%
+    paste(collapse = '') %>%
+    read_html() %>% 
+    html_nodes(xpath = '//*[@id="div_transactions_other"]') %>%
+    html_nodes('p') %>% html_text()
+  
+  #find the transaction that matches the date in our signedPlayers dataframe (the date they signed as a free agent)
+  #try to change date into format used by bref (month day, year)
+  #if there is no error, continue
+  #if there is an error with this, find all free agent signings listed as before the upcoming season
+  #(this way, we are only looking at transactions in offseason we're looking for)
+  transactions <- tryCatch(expr = transactions[grepl(sub(' 0', ' ', format(as.Date(signedPlayers$dateSigned[player]), '%B %d, %Y')), transactions)], error = function(cond) {
+    
+    return(transactions[grepl('Before', transactions) & grepl(as.character(as.integer(signedPlayers$faYear[player])), transactions) & grepl('Free Agent', transactions)])
+    
+  })
+  
+  #find the team that matches this transaction (who the player signed with)
+  #add it to the 'toTeam' column in 'signedPlayers'
+  signedPlayers$toTeam[player] <- teams$franchID[grepl((sub('[.]', '', (sub('.*the ', '', transactions)))), teams$name)]
+}
+
+#combine all the free agents into one dataframe
+allPlayers <- rbind(signedPlayers, unsignedBatters, unsignedPitchers)
+
+```
+
+The first thing we want to analyze is how the rate of players resigning with their original team in free agency has changed over time.
+
+To do this, let's add a few columns to our 'TeamYears' dataframe.
+
+'numFA' will contain the total number of free agents the team had in a given offseason.
+'numResigned' will contain the total number of free agents each team resigned in the offseason.
+'numUnsigned will contain the total number of free agents for each team that went unsigned in free agency.
+
+```{r}
+
+TeamYears$yearID <- as.double(TeamYears$yearID)
+teamFAData <- allPlayers %>% group_by(faYear, fromTeam) %>%
+  summarise(numFA = n(),
+            numResigned = sum(fromTeam == toTeam),
+            numUnsigned = sum(toTeam == 'Unsigned'))
+
+TeamYears <- TeamYears %>% full_join(teamFAData, by = c('yearID' = 'faYear', 'franchID' = 'fromTeam'))
+
+TeamYears$numFA[is.na(TeamYears$numFA)] = 0
+TeamYears$numResigned[is.na(TeamYears$numResigned)] = 0
+TeamYears$numUnsigned[is.na(TeamYears$numUnsigned)] = 0
+
+#finally, using the columns we just created, let's create a 'resignRate' column that calculates the percentage of their free agents each team resigned in the offseason
+TeamYears$resignRate <- formattable::percent(round(TeamYears$numResigned/TeamYears$numFA, 3))
+
+```
+
+Let's create a line graph that shows how the different variables have changed over the dataset.
+
+```{r}
+
+#first, let's summarise the data by year from 1977 to 2020 (there were no FAs in 1976):
+#we will also filter out teams with an NA value in 'round' (these are expansion teams that should not be included in the dataset)
+FAsbyYear <- TeamYears %>% filter(yearID >= 1977, !is.na(round)) %>% 
+  group_by(yearID) %>%
+  summarise(totalFAs = sum(numFA),
+            totalResigned = sum(numResigned),
+            totalUnsigned = sum(numUnsigned),
+            totalResignRate = formattable::percent(round(totalResigned/totalFAs, 3)),
+            totalUnsignRate = formattable::percent(round(totalUnsigned/totalFAs, 3)))
+
+#now, let's create a line graph that shows how the number of total free agents has changed over time:
+
+FAsbyYear %>%
+  ggplot(aes(yearID, totalFAs)) + 
+  geom_line(color = 'steelblue', size = 1.5) +
+  xlab('Year') +
+  ylab('Total Number of Free Agents') +
+  ggtitle('Number of MLB Free Agents Per Year from 1977-2020') +
+  theme_stata()
+
+```
+From the graph, we can see the number of FAs remained low at the beginning of free agency, peaked in the early 2000s, and has remained mostly steady since then.
+
+Now, let's look at how the resign rate has changed over time
+```{r}
+
+FAsbyYear %>%
+  ggplot(aes(yearID, totalResignRate)) + 
+  geom_line(color = 'steelblue', size = 1.5) +
+  xlab('Year') +
+  ylab('Resign Rate') +
+  ggtitle('Resign Rate of MLB Free Agents Per Year from 1977-2020') +
+  theme_stata()
+
+```
+When there were fewer free agents, early in our dataset, the resign rate fluctuated more wildly. Now, the rate appears to be mostly steady, around 17-18% (although the rate seems slightly lower over the last few years)
+
+Let's now look at the same graph, but instead look at unsigned rate:
+
+```{r}
+
+FAsbyYear %>%
+  ggplot(aes(yearID, totalUnsignRate)) + 
+  geom_line(color = 'steelblue', size = 1.5) +
+  xlab('Year') +
+  ylab('Unsigned Rate') +
+  ggtitle('Unsigned Rate of MLB Free Agents Per Year from 1977-2020') +
+  theme_stata()
+
+```
+From the graph, we see that the rate of players who have gone unsigned in free agency has decreased from the early days of Free Agency.
+The rate reached a low point in the early 2000s, but has crept up recently.
+
+
+The second thing we want to look at is how the rate of players resigning with their original team changes depending on how the team did in the postseason (what round they lost in).
+
+```{r}
+
+#first, let's summarise the data by 'round' from 1977 to 2020:
+FAsbyYear <- TeamYears %>% filter(yearID >= 1977, !is.na(round)) %>%
+  group_by(round) %>%
+  summarise(totalFAs = sum(numFA),
+            totalResigned = sum(numResigned),
+            totalUnsigned = sum(numUnsigned),
+            totalResignRate = formattable::percent(round(totalResigned/totalFAs, 3)),
+            totalUnsignRate = formattable::percent(round(totalUnsigned/totalFAs, 3)))
+
+#first, let's graph the total number of free agents in each category to get a sense of the sample size
+
+color_palette <- colorRampPalette(colors = c('lightskyblue', "darkblue"))(length(FAsbyYear$round))
+
+FAsbyYear %>%
+  ggplot(aes(round, totalFAs, fill = round)) + 
+  geom_col() +
+  labs(title = 'Number of MLB Free Agents by Team Playoff Finish', subtitle = 'Data from 1977-2020', 
+       x = 'Postseason Round', y = 'Number of Free Agents') +
+  theme_stata() + 
+  scale_fill_manual('legend', values = color_palette)
+
+
+```
+Unsurprisingly, most free agents come from teams that don't make the playoffs (since most teams don't make the playoffs).
+Since the wild card round was only introduced in 2012, this has the fewest number of free agents.
+
+Next, let's look at the resign rate by playoff round:
+```{r}
+
+FAsbyYear %>%
+  ggplot(aes(round, totalResignRate, fill = round)) + 
+  geom_col() +
+  labs(title = 'Resign Rate of MLB Free Agents by Team Playoff Finish', subtitle = 'Data from 1977-2020', 
+       x = 'Postseason Round', y = 'Resign Rate') +
+  theme_stata() + 
+  scale_fill_manual('legend', values = color_palette)
+
+```
+The resign rate is highest for teams that win the world series.
+The next highest is for teams that lose in the world series.
+The graph shows that as a team gets more success in the playoffs, the percent of players they resign in free agency increases slightly.
+
+
+Finally, let's look at the unsign rate:
+```{r}
+
+FAsbyYear %>%
+  ggplot(aes(round, totalUnsignRate, fill = round)) + 
+  geom_col() +
+  labs(title = 'Unsign Rate of MLB Free Agents by Team Playoff Finish', subtitle = 'Data from 1977-2020', 
+       x = 'Postseason Round', y = 'Unsign Rate') +
+  theme_stata() + 
+  scale_fill_manual('legend', values = color_palette)
+
+```
+Teams that don't make the playoffs have the highest unsign rate in the group. This makes sense, since they likely have less talented players that may be less likely to have demand on the free agent market.
